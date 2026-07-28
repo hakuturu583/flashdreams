@@ -230,26 +230,34 @@ FP8 path:
 
 The bundled ``example_world_model_rtx3090.yaml`` manifest packages these
 choices (PyTorch path, LightVAE + LightTAE, ``skip_finalize_kv_cache``, and a
-``640 x 352`` default biased toward ~10 effective FPS):
+``512 x 288`` default biased toward ~10 effective FPS within a ~20 GB VRAM
+budget). The ``PYTORCH_CUDA_ALLOC_CONF`` env var trims reserved-but-unused
+memory, which helps hold the peak near ~20 GB:
 
 .. code-block:: bash
 
+   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
    uv run --package flashdreams-omnidreams interactive-drive \
        --manifest example_world_model_rtx3090.yaml \
        --offload-text-encoder \
        --stream-mjpeg :8080
 
-Step the manifest's ``resolution_wh`` up (``[896, 496]``, ``[1024, 560]``) if
-the card has FPS/VRAM headroom, or down (``[512, 288]``) if you OOM or fall
-short of 10 FPS. Native acceleration (``native_dit_acceleration: required``,
-``fp8_kvcache_cudnn``, Sparge/SageAttention) is **not** available on Ampere and
-must stay disabled here -- it requires a Blackwell-class GPU (SM 12.0).
+To hold a ~20 GB peak, in priority order: keep ``--offload-text-encoder`` on
+(~15 GB saving), keep the resolution low (lower ``resolution_wh`` cuts both the
+activation working set and the CUDA-graph pool *and* raises FPS), run with
+``expandable_segments:True``, and only as a last resort set ``compile_net:
+false`` to drop the CUDA-graph private pool (saves VRAM but lowers FPS). Step
+``resolution_wh`` up (``[640, 352]``, ``[896, 496]``) only if the card shows FPS
+*and* VRAM headroom. Native acceleration (``native_dit_acceleration:
+required``, ``fp8_kvcache_cudnn``, Sparge/SageAttention) is **not** available on
+Ampere and must stay disabled here -- it requires a Blackwell-class GPU
+(SM 12.0).
 
 .. note::
 
    The 3090 runs the PyTorch (non-native) path, so the published GB300 latency
-   table does not apply. Actual FPS and whether a given resolution fits 24 GB
-   must be confirmed on the target card; treat the ``640 x 352`` default as a
+   table does not apply. Actual FPS and the real VRAM peak must be confirmed on
+   the target card; treat the ``512 x 288`` default and the ~20 GB budget as a
    starting point on the ladder, not a guaranteed operating point.
 
 For execution using a consumer NVIDIA GPU that exposes a graphics stack,
