@@ -230,9 +230,13 @@ FP8 path:
 
 The bundled ``example_world_model_rtx3090.yaml`` manifest packages these
 choices (PyTorch path, LightVAE + LightTAE, ``skip_finalize_kv_cache``, and a
-``512 x 288`` default biased toward ~10 effective FPS within a ~20 GB VRAM
-budget). The ``PYTORCH_CUDA_ALLOC_CONF`` env var trims reserved-but-unused
-memory, which helps hold the peak near ~20 GB:
+``640 x 352`` default biased toward ~10 effective FPS within a ~20 GB VRAM
+budget). ``640 x 352`` (~360p) is the resolution class used by real-time
+end-to-end driving stacks (e.g. openpilot, CARLA E2E planners), so it is
+representative of common E2E-AD input while staying feasible on a 24 GB card;
+the model's native 720p (``1280 x 704``) does not fit a 3090 even with the text
+encoder offloaded. The ``PYTORCH_CUDA_ALLOC_CONF`` env var trims
+reserved-but-unused memory, which helps hold the peak near ~20 GB:
 
 .. code-block:: bash
 
@@ -246,9 +250,10 @@ To hold a ~20 GB peak, in priority order: keep ``--offload-text-encoder`` on
 (~15 GB saving), keep the resolution low (lower ``resolution_wh`` cuts both the
 activation working set and the CUDA-graph pool *and* raises FPS), run with
 ``expandable_segments:True``, and only as a last resort set ``compile_net:
-false`` to drop the CUDA-graph private pool (saves VRAM but lowers FPS). Step
-``resolution_wh`` up (``[640, 352]``, ``[896, 496]``) only if the card shows FPS
-*and* VRAM headroom. Native acceleration (``native_dit_acceleration:
+false`` to drop the CUDA-graph private pool (saves VRAM but lowers FPS) or step
+down to ``[512, 288]``. Step ``resolution_wh`` up (``[896, 496]``,
+``[1024, 560]``) only if the card shows FPS *and* VRAM headroom. Native
+acceleration (``native_dit_acceleration:
 required``, ``fp8_kvcache_cudnn``, Sparge/SageAttention) is **not** available on
 Ampere and must stay disabled here -- it requires a Blackwell-class GPU
 (SM 12.0).
@@ -257,7 +262,7 @@ Ampere and must stay disabled here -- it requires a Blackwell-class GPU
 
    The 3090 runs the PyTorch (non-native) path, so the published GB300 latency
    table does not apply. Actual FPS and the real VRAM peak must be confirmed on
-   the target card; treat the ``512 x 288`` default and the ~20 GB budget as a
+   the target card; treat the ``640 x 352`` default and the ~20 GB budget as a
    starting point on the ladder, not a guaranteed operating point.
 
 For execution using a consumer NVIDIA GPU that exposes a graphics stack,

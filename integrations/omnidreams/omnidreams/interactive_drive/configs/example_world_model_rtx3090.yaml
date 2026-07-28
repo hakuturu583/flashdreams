@@ -36,24 +36,32 @@
 # pool, and per-chunk activations -- the last two scale with resolution. To hold
 # ~20 GB, in priority order:
 #   1. Keep --offload-text-encoder on (biggest single saving, ~15 GB).
-#   2. Keep resolution low (this manifest defaults to 512x288). Lower res cuts
+#   2. Keep resolution low (this manifest defaults to 640x352). Lower res cuts
 #      BOTH the activation working set and the CUDA-graph pool, and it raises
 #      FPS -- so it helps the 10 FPS and the 20 GB goals at once, at image-quality
 #      cost.
 #   3. Run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
 #   4. Last resort, if the peak still tops 20 GB: set compile_net: false to drop
 #      the CUDA-graph private pool (saves reserved VRAM but lowers FPS -- a
-#      direct trade against the 10 FPS target).
+#      direct trade against the 10 FPS target), or step down to [512, 288].
+#
+# Default resolution: 640x352 (~360p). This is the resolution class used by
+# real-time end-to-end driving stacks (e.g. openpilot at 512x256, CARLA E2E
+# planners around 256-360p), so it is representative of common E2E-AD input
+# while staying feasible on a single 24 GB Ampere card. Note the model's native
+# training resolution is 720p (1280x704) -- that does NOT fit a 3090 even with
+# --offload-text-encoder, so the native/nuScenes-scale resolutions are off the
+# table here.
 #
 # Resolution ladder (all tested, aspect-compatible, multiples of 16). Lower =
 # faster + less VRAM, at the usual image-quality cost. Step UP from the default
 # only if the card shows FPS *and* VRAM headroom; step DOWN if you OOM / exceed
 # the ~20 GB budget / fall short of 10 FPS:
-#   - [1024, 560]
-#   - [896, 496]
-#   - [640, 352]   <- raise to this if ~20 GB has headroom to spare
-#   - [512, 288]   <- default: biases toward the ~10 FPS / ~20 GB targets
-resolution_wh: [512, 288]
+#   - [1024, 560]  (~560p, perception-scale E2E; unlikely to hold 10 FPS/20 GB)
+#   - [896, 496]   (~480p; higher fidelity, tighter on FPS/VRAM)
+#   - [640, 352]   <- default: driving-typical ~360p, best 10 FPS / ~20 GB balance
+#   - [512, 288]   (~288p fallback if 640x352 can't hold 10 FPS / 20 GB)
+resolution_wh: [640, 352]
 fps: 30
 # LightVAE single-view recipe is fixed at 8-frame steady-state blocks.
 num_frames_per_block: 8
