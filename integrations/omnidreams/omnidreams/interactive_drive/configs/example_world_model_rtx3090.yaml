@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# World-model manifest tuned for a *single* 24 GB Ampere GPU (e.g. RTX 3090),
+# targeting ~10 effective FPS for the interactive-drive single-view demo.
+#
+# Why this manifest exists
+# ------------------------
+# The published perf path (example_world_model_perf.yaml) reaches its GB300
+# numbers through the OmniDreams single-view native CUDA extension, whose FP8
+# KV-cache / cuDNN / Sparge / SageAttention backends require a Blackwell-class
+# GPU (SM 12.0) or newer. That path CANNOT run on Ampere (SM 8.6). So on a
+# 3090 we stay on the standard PyTorch bf16 path (native_dit_acceleration:
+# disabled) and lean on the three levers that Ampere *can* use:
+#
+#   1. torch.compile + CUDA graphs      (compile_net: true)
+#   2. the light VAE encoder + LightTAE (light_vae: true)
+#   3. a reduced resolution             (resolution_wh, see the ladder below)
+#
+# and, on the CLI side, --offload-text-encoder to free the ~15 GB Cosmos-Reason1
+# text encoder before the diffusion pipeline is built (it is run once per scene
+# and its embeddings are cached). Recommended launch:
+#
+#   uv run --package flashdreams-omnidreams interactive-drive \
+#       --manifest example_world_model_rtx3090.yaml \
+#       --offload-text-encoder \
+#       --stream-mjpeg :8080
+#
+# Resolution ladder (all tested, aspect-compatible, multiples of 16). Lower =
+# faster + less VRAM, at the usual image-quality cost. Start at the default
+# below; step UP if the card has FPS/VRAM headroom, step DOWN if you OOM or fall
+# short of 10 FPS:
+#   - [1024, 560]
+#   - [896, 496]
+#   - [640, 352]   <- default here: biases toward the ~10 FPS / 24 GB target
+#   - [512, 288]   <- fallback if 640x352 still can't hold 10 FPS
+resolution_wh: [640, 352]
+fps: 30
+# LightVAE single-view recipe is fixed at 8-frame steady-state blocks.
+num_frames_per_block: 8
+# Compile + CUDA graphs ON: essential for steady-state FPS on Ampere. Cost: the
+# first real chunk is slow (one-time compile / graph capture / Triton
+# autotune); subsequent chunks reuse the cached kernels. Set to false only for
+# quick GUI bring-up debugging.
+compile_net: true
+light_vae: true
+encode_with_pixel_shuffle: false
+# Single-view VAE checkpoints require local_attn_size == 6.
+local_attn_size: 6
+# Skip the post-rollout KV-cache finalize step (as in the perf manifest) to
+# shave per-chunk latency.
+skip_finalize_kv_cache: true
+sink_size: 0
+# Two-step distilled schedule; [1000, 100] matches the perf terminal-noise
+# choice (still 2 denoising steps, the distilled minimum).
+denoising_steps: [1000, 100]
+upsampling_enabled: false
+upsampling_scale: 4
+device: cuda:0
+seed_for_every_rollout:
+
+# Native acceleration stays DISABLED: the OmniDreams single-view extension is
+# Blackwell-only (SM 12.0) and will not build/run on Ampere. Do not enable
+# these on a 3090.
+native_dit_acceleration: disabled            # disabled | auto | required
+native_dit_backend: bf16                     # fp8_kvcache_cudnn | bf16
+native_dit_attention_backend: auto           # auto | cudnn | sparge | sage3 | sage3_fp8
+native_vae_encoder: disabled                 # disabled | fp8

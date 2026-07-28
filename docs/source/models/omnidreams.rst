@@ -214,6 +214,44 @@ network and pick a scene from the picker in the bottom-right.
    resident, so the first load and scene/variant switches are slower. Prefer it
    when VRAM-constrained; otherwise leave it off for faster switching.
 
+Single 24 GB GPU (e.g. RTX 3090)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+OmniDreams' ~48 GB minimum assumes the default resolution with the text
+encoder resident. A single 24 GB Ampere card can still run the single-view
+demo by combining three levers, none of which need the (Blackwell-only) native
+FP8 path:
+
+- ``--offload-text-encoder`` frees the ~15 GB Cosmos-Reason1 text encoder
+  before the diffusion pipeline is built.
+- A reduced ``resolution_wh`` cuts per-chunk DiT/VAE work and activation memory.
+- ``compile_net: true`` keeps ``torch.compile`` + CUDA graphs on the standard
+  PyTorch bf16 path, which is what makes steady-state FPS viable on Ampere.
+
+The bundled ``example_world_model_rtx3090.yaml`` manifest packages these
+choices (PyTorch path, LightVAE + LightTAE, ``skip_finalize_kv_cache``, and a
+``640 x 352`` default biased toward ~10 effective FPS):
+
+.. code-block:: bash
+
+   uv run --package flashdreams-omnidreams interactive-drive \
+       --manifest example_world_model_rtx3090.yaml \
+       --offload-text-encoder \
+       --stream-mjpeg :8080
+
+Step the manifest's ``resolution_wh`` up (``[896, 496]``, ``[1024, 560]``) if
+the card has FPS/VRAM headroom, or down (``[512, 288]``) if you OOM or fall
+short of 10 FPS. Native acceleration (``native_dit_acceleration: required``,
+``fp8_kvcache_cudnn``, Sparge/SageAttention) is **not** available on Ampere and
+must stay disabled here -- it requires a Blackwell-class GPU (SM 12.0).
+
+.. note::
+
+   The 3090 runs the PyTorch (non-native) path, so the published GB300 latency
+   table does not apply. Actual FPS and whether a given resolution fits 24 GB
+   must be confirmed on the target card; treat the ``640 x 352`` default as a
+   starting point on the ladder, not a guaranteed operating point.
+
 For execution using a consumer NVIDIA GPU that exposes a graphics stack,
 omit the ``--stream-mjpeg`` flag to open the demo in a local Vulkan window
 instead:
