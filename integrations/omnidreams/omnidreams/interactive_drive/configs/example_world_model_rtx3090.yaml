@@ -1,9 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# World-model manifest tuned for a *single* 24 GB Ampere GPU (e.g. RTX 3090),
-# targeting ~10 effective FPS while keeping the VRAM peak around ~20 GB (i.e.
-# leaving headroom under the card's 24 GB) for the single-view demo.
+# World-model manifest tuned for a *single* 24 GB Ampere GPU (e.g. RTX 3090)
+# running the single-view demo.
+#
+# Measured on an RTX 3090 (SM 8.6, driver 580, CUDA 13.0, torch 2.12.1) with
+# --offload-text-encoder and PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,
+# scene clipgt-0d404ff7 (default variant), 8 frames/chunk:
+#
+#   resolution   chunk time (mean/min/max)   effective FPS   VRAM peak
+#   512 x 288    274.9 / 211.0 / 300.9 ms    29.1            16.27 GiB
+#   640 x 352    403.6 / 318.8 / 434.3 ms    19.8            16.27 GiB
+#
+# Both resolutions clear the original ~10 FPS goal with room to spare, so the
+# default is 512 x 288: it is the only one of the two that keeps the generator
+# at (or very near) the 30 fps presentation cadence -- see "Why 512 x 288"
+# below for why that specifically matters for perceived smoothness.
+#
+# Note the VRAM peak is IDENTICAL at both resolutions: the peak is set by the
+# Cosmos-Reason1 text encoder while it is still resident during init, not by
+# the per-chunk activations. Resolution therefore buys FPS here, not headroom.
+# Steady-state usage after the encoder is offloaded is ~11.6-12.8 GiB.
 #
 # Why this manifest exists
 # ------------------------
@@ -21,7 +38,7 @@
 # and, on the CLI side, --offload-text-encoder to free the ~15 GB Cosmos-Reason1
 # text encoder before the diffusion pipeline is built (it is run once per scene
 # and its embeddings are cached). Recommended launch (the alloc-conf env var
-# trims reserved-but-unused VRAM, which helps hold the peak near ~20 GB):
+# trims reserved-but-unused VRAM):
 #
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 #   uv run --package flashdreams-omnidreams interactive-drive \
@@ -29,46 +46,74 @@
 #       --offload-text-encoder \
 #       --stream-mjpeg :8080
 #
-# Fitting a ~20 GB VRAM budget
-# ----------------------------
+# VRAM
+# ----
 # After --offload-text-encoder the resident set is the 2B DiT (~4-5 GB bf16),
 # the LightVAE encoder + LightTAE decoder (~1-2 GB), the CUDA-graph capture
-# pool, and per-chunk activations -- the last two scale with resolution. To hold
-# ~20 GB, in priority order:
-#   1. Keep --offload-text-encoder on (biggest single saving, ~15 GB).
-#   2. Keep resolution low (this manifest defaults to 640x352). Lower res cuts
-#      BOTH the activation working set and the CUDA-graph pool, and it raises
-#      FPS -- so it helps the 10 FPS and the 20 GB goals at once, at image-quality
-#      cost.
-#   3. Run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
-#   4. Last resort, if the peak still tops 20 GB: set compile_net: false to drop
-#      the CUDA-graph private pool (saves reserved VRAM but lowers FPS -- a
-#      direct trade against the 10 FPS target), or step down to [512, 288].
+# pool, and per-chunk activations. Measured steady state is ~11.6-12.8 GiB and
+# the 16.27 GiB peak lands during init, while the text encoder is still
+# resident -- so on a 24 GB card VRAM is NOT the binding constraint at these
+# resolutions, and the levers below matter for FPS rather than for headroom:
+#   1. Keep --offload-text-encoder on (biggest single saving, ~15 GB). This is
+#      what turns a >24 GB init peak into 16.27 GiB.
+#   2. Run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+#   3. Only if a future change does push the peak up: set compile_net: false to
+#      drop the CUDA-graph private pool (saves reserved VRAM but costs a large
+#      chunk of the FPS), or step down a rung on the ladder below.
 #
-# Default resolution: 640x352 (~360p). This is the resolution class used by
-# real-time end-to-end driving stacks (e.g. openpilot at 512x256, CARLA E2E
-# planners around 256-360p), so it is representative of common E2E-AD input
-# while staying feasible on a single 24 GB Ampere card. Note the model's native
-# training resolution is 720p (1280x704) -- that does NOT fit a 3090 even with
-# --offload-text-encoder, so the native/nuScenes-scale resolutions are off the
-# table here.
+# Why 512x288
+# -----------
+# The presentation loop paces at 1/fps (33.3 ms at fps: 30) and re-presents the
+# previous frame whenever the next generated frame is not ready yet, so any
+# shortfall of the generator against the display cadence shows up directly as
+# duplicated frames and visible judder. At 640x352 the generator supplies
+# 19.8 FPS against a 30 fps cadence -> ~34% of presented frames are repeats.
+# At 512x288 it supplies 29.1 FPS, which very nearly closes that gap. That is
+# the reason for the default, not a VRAM constraint.
 #
-# Resolution ladder (all tested, aspect-compatible, multiples of 16). Lower =
-# faster + less VRAM, at the usual image-quality cost. Step UP from the default
-# only if the card shows FPS *and* VRAM headroom; step DOWN if you OOM / exceed
-# the ~20 GB budget / fall short of 10 FPS:
-#   - [1024, 560]  (~560p, perception-scale E2E; unlikely to hold 10 FPS/20 GB)
-#   - [896, 496]   (~480p; higher fidelity, tighter on FPS/VRAM)
-#   - [640, 352]   <- default: driving-typical ~360p, best 10 FPS / ~20 GB balance
-#   - [512, 288]   (~288p fallback if 640x352 can't hold 10 FPS / 20 GB)
-resolution_wh: [640, 352]
+# 512x288 is also in the resolution class used by real-time end-to-end driving
+# stacks (openpilot runs 512x256), so it stays representative of common E2E-AD
+# input. The model's native training resolution is 720p (1280x704), which does
+# not fit a 3090 even with --offload-text-encoder.
+#
+# Resolution ladder (aspect-compatible, multiples of 16). The two marked
+# "measured" carry the numbers at the top of this file; the larger two are
+# untested on a 3090 and are extrapolations from the 512->640 scaling:
+#   - [1024, 560]  (~560p; expect well under 10 FPS -- not recommended here)
+#   - [896, 496]   (~480p; expect ~10-12 FPS, judder-heavy against 30 fps)
+#   - [640, 352]   (~360p; measured 19.8 FPS -- better fidelity, ~34% dup frames)
+#   - [512, 288]   <- default: measured 29.1 FPS, ~matches the 30 fps cadence
+resolution_wh: [512, 288]
 fps: 30
 # LightVAE single-view recipe is fixed at 8-frame steady-state blocks.
 num_frames_per_block: 8
-# Compile + CUDA graphs ON: essential for steady-state FPS on Ampere. Cost: the
-# first real chunk is slow (one-time compile / graph capture / Triton
-# autotune); subsequent chunks reuse the cached kernels. Set to false only for
-# quick GUI bring-up debugging.
+# Compile + CUDA graphs ON: essential for steady-state FPS on Ampere -- the
+# first chunk runs ~1400x slower than the steady state (measured 423.1 s vs
+# 403.6 ms at 640x352), and all of that gap is one-time compile work.
+#
+# Cost breakdown on a cold cache, and what a warm cache actually saves
+# (measured, 640x352, same config re-run):
+#   cold first chunk: 423.1 s   (50 Triton autotune sweeps, 219.2 s of them)
+#   warm first chunk:  28.0 s   (0 autotune sweeps -- 15x faster)
+# Inductor persists the traced graphs, generated kernels and autotune winners
+# to TORCHINDUCTOR_CACHE_DIR, so only the first launch per (shape, config) pays
+# the full price. The residual ~28 s is CUDA-graph capture, which is tied to
+# process-local device addresses and therefore can never be cached to disk.
+#
+# Two operational consequences:
+#   - The default cache dir is /tmp/torchinductor_<user>, which a reboot or a
+#     tmpfiles sweep will delete, silently putting you back on the 7-minute
+#     path. Export TORCHINDUCTOR_CACHE_DIR to somewhere persistent.
+#   - The cache is keyed on tensor shape, so changing resolution_wh forces a
+#     full recompile. Budget ~7 min the first time you move a rung on the
+#     ladder above.
+#
+# Ampere-specific note: Inductor's Triton search space includes configs needing
+# 128-192 KB of shared memory, above the SM 8.6 limit of 101376 B. Those get
+# benchmarked and discarded ("No valid triton configs ... Ignoring this
+# choice"), which is harmless but inflates cold-start time on this card.
+#
+# Set to false only for quick GUI bring-up debugging.
 compile_net: true
 light_vae: true
 encode_with_pixel_shuffle: false

@@ -230,13 +230,38 @@ FP8 path:
 
 The bundled ``example_world_model_rtx3090.yaml`` manifest packages these
 choices (PyTorch path, LightVAE + LightTAE, ``skip_finalize_kv_cache``, and a
-``640 x 352`` default biased toward ~10 effective FPS within a ~20 GB VRAM
-budget). ``640 x 352`` (~360p) is the resolution class used by real-time
-end-to-end driving stacks (e.g. openpilot, CARLA E2E planners), so it is
-representative of common E2E-AD input while staying feasible on a 24 GB card;
-the model's native 720p (``1280 x 704``) does not fit a 3090 even with the text
-encoder offloaded. The ``PYTORCH_CUDA_ALLOC_CONF`` env var trims
-reserved-but-unused memory, which helps hold the peak near ~20 GB:
+``512 x 288`` default). Measured on an RTX 3090 (SM 8.6, driver 580, CUDA 13.0,
+torch 2.12.1) with the launch command below, 8 frames per chunk:
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``resolution_wh``
+     - chunk time (mean)
+     - effective FPS
+     - VRAM peak
+   * - ``[512, 288]`` (default)
+     - 274.9 ms
+     - 29.1
+     - 16.27 GiB
+   * - ``[640, 352]``
+     - 403.6 ms
+     - 19.8
+     - 16.27 GiB
+
+The VRAM peak is identical at both resolutions because it is set by the
+Cosmos-Reason1 text encoder while it is still resident during init, not by the
+per-chunk activations; steady state after the offload is ~11.6-12.8 GiB. On a
+24 GB card resolution therefore buys FPS, not headroom. ``512 x 288`` is the
+default because the presentation loop paces at ``1/fps`` and re-presents the
+previous frame when the next one is not ready, so a generator running below the
+30 fps cadence produces duplicated frames and visible judder -- at
+``640 x 352`` roughly 34% of presented frames are repeats, while ``512 x 288``
+very nearly closes the gap. ``512 x 288`` also matches the resolution class of
+real-time end-to-end driving stacks (openpilot runs ``512 x 256``); the model's
+native 720p (``1280 x 704``) does not fit a 3090 even with the text encoder
+offloaded. The ``PYTORCH_CUDA_ALLOC_CONF`` env var trims reserved-but-unused
+memory:
 
 .. code-block:: bash
 
@@ -246,24 +271,33 @@ reserved-but-unused memory, which helps hold the peak near ~20 GB:
        --offload-text-encoder \
        --stream-mjpeg :8080
 
-To hold a ~20 GB peak, in priority order: keep ``--offload-text-encoder`` on
-(~15 GB saving), keep the resolution low (lower ``resolution_wh`` cuts both the
-activation working set and the CUDA-graph pool *and* raises FPS), run with
-``expandable_segments:True``, and only as a last resort set ``compile_net:
-false`` to drop the CUDA-graph private pool (saves VRAM but lowers FPS) or step
-down to ``[512, 288]``. Step ``resolution_wh`` up (``[896, 496]``,
-``[1024, 560]``) only if the card shows FPS *and* VRAM headroom. Native
-acceleration (``native_dit_acceleration:
-required``, ``fp8_kvcache_cudnn``, Sparge/SageAttention) is **not** available on
-Ampere and must stay disabled here -- it requires a Blackwell-class GPU
-(SM 12.0).
+Keep ``--offload-text-encoder`` on -- it is what turns a >24 GB init peak into
+the measured 16.27 GiB -- and run with ``expandable_segments:True``. Step
+``resolution_wh`` up (``[640, 352]`` for more fidelity at 19.8 FPS, or the
+untested ``[896, 496]`` / ``[1024, 560]``) only if you can accept the
+proportional loss of smoothness. Native acceleration
+(``native_dit_acceleration: required``, ``fp8_kvcache_cudnn``,
+Sparge/SageAttention) is **not** available on Ampere and must stay disabled
+here -- it requires a Blackwell-class GPU (SM 12.0).
+
+.. note::
+
+   ``compile_net: true`` makes the *first* chunk far slower than the steady
+   state: 423.1 s versus 403.6 ms at ``640 x 352``, almost all of it one-time
+   ``torch.compile`` work (50 Triton autotune sweeps, 219.2 s of them). Inductor
+   persists graphs, kernels and autotune winners to ``TORCHINDUCTOR_CACHE_DIR``,
+   so re-running the same configuration drops the first chunk to 28.0 s; the
+   residual is CUDA-graph capture, which is process-local and cannot be cached.
+   The default cache dir is ``/tmp/torchinductor_<user>``, so export
+   ``TORCHINDUCTOR_CACHE_DIR`` to a persistent path or a reboot silently
+   restores the multi-minute cold start. The cache is keyed on tensor shape,
+   so changing ``resolution_wh`` forces a full recompile.
 
 .. note::
 
    The 3090 runs the PyTorch (non-native) path, so the published GB300 latency
-   table does not apply. Actual FPS and the real VRAM peak must be confirmed on
-   the target card; treat the ``640 x 352`` default and the ~20 GB budget as a
-   starting point on the ladder, not a guaranteed operating point.
+   table does not apply. The numbers above were measured on one card with one
+   scene; treat them as a reference point rather than a guarantee.
 
 For execution using a consumer NVIDIA GPU that exposes a graphics stack,
 omit the ``--stream-mjpeg`` flag to open the demo in a local Vulkan window
