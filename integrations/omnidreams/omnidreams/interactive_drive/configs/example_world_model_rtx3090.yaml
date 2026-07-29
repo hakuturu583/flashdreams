@@ -122,7 +122,25 @@ local_attn_size: 6
 # Skip the post-rollout KV-cache finalize step (as in the perf manifest) to
 # shave per-chunk latency.
 skip_finalize_kv_cache: true
-sink_size: 0
+# Attention-sink frames. The KV cache is laid out as [sink | local window]
+# (flashdreams/core/attention/kvcache.py) and only the window rolls, so these
+# frames stay in context for the whole rollout instead of scrolling out after
+# local_attn_size chunks.
+#
+# Why non-zero here: with sink_size 0 the scene's real initial frame leaves the
+# cache within a few seconds, after which every chunk is conditioned purely on
+# the model's own previous output. Errors then become the new "truth" and
+# compound -- the "world falls apart after driving a while" failure. Retaining
+# the first frames as permanent sinks is the standard StreamingLLM-style
+# mitigation for exactly that.
+#
+# Cost: the cache grows by sink_size/local_attn_size (~33% at 2/6) and the
+# cache shape change forces one full recompile.
+#
+# NOTE: this is a *deploy-side* mitigation and cannot fully fix drift, which is
+# a training-time problem -- see the upstream "Clean Forcing drift corrector"
+# work (NVIDIA/flashdreams#398) for the principled fix.
+sink_size: 2
 # Two-step distilled schedule; [1000, 100] matches the perf terminal-noise
 # choice (still 2 denoising steps, the distilled minimum).
 denoising_steps: [1000, 100]

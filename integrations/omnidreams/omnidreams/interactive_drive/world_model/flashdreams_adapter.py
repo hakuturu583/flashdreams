@@ -52,10 +52,8 @@ def _select_config_name(manifest: WorldModelManifest) -> str:
         raise NotImplementedError(
             "flashdreams interactive-drive path does not support upsampling."
         )
-    if manifest.sink_size != 0:
-        raise NotImplementedError(
-            "flashdreams interactive-drive path currently supports sink_size=0 only."
-        )
+    if manifest.sink_size < 0:
+        raise ValueError("sink_size must be non-negative.")
 
     if manifest.encode_with_pixel_shuffle:
         if manifest.num_frames_per_block != 16:
@@ -283,6 +281,13 @@ def _native_vae_overrides(manifest: WorldModelManifest) -> dict[str, object]:
 
 def _transformer_overrides(manifest: WorldModelManifest) -> dict[str, object]:
     return {
+        # Attention-sink frames retained permanently at the head of the KV
+        # cache (``BlockKVCache`` layout is ``[sink | local window]`` and only
+        # the window rolls). Non-zero keeps the rollout's first frames -- the
+        # ones derived from the scene's real initial image -- in context for
+        # every later chunk instead of letting them scroll out, which is the
+        # standard mitigation for long-rollout autoregressive drift.
+        "sink_size_t": manifest.sink_size,
         "skip_finalize_kv_cache": manifest.skip_finalize_kv_cache,
         "compile_network": manifest.compile_net,
         "native_dit_acceleration": manifest.native_dit_acceleration,
