@@ -278,7 +278,14 @@ class WorldModelRenderBackend(RenderBackend):
             ),
         )
 
-    def replace_prompt(self, prompt: str) -> None:
+    def replace_prompt(
+        self,
+        prompt: str,
+        *,
+        guidance_scale: float = 1.0,
+        guidance_chunks: int = 0,
+        recache_last_chunk: bool = False,
+    ) -> None:
         """Condition the rest of the rollout on ``prompt``.
 
         Before the first chunk this only changes the prompt the rollout will
@@ -287,6 +294,10 @@ class WorldModelRenderBackend(RenderBackend):
         conditioning (``replace_text``: the visual history stays, the next
         chunk is generated under the new prompt). The scene keeps the prompt,
         so a restarted rollout begins with it too.
+
+        ``guidance_scale`` / ``guidance_chunks`` / ``recache_last_chunk`` are
+        passed to ``replace_text``: new-minus-old prompt guidance over the next
+        chunks, which pushes the change through faster than the plain swap.
 
         Raises:
             NotImplementedError: The pipeline cannot replace a live prompt.
@@ -303,7 +314,13 @@ class WorldModelRenderBackend(RenderBackend):
             )
         self._finalize_pending()
         with torch.cuda.device(self._pipeline.device):
-            replace_text(self._cache, [[prompt]])
+            replace_text(
+                self._cache,
+                [[prompt]],
+                guidance_scale=guidance_scale,
+                guidance_chunks=guidance_chunks,
+                recache_last_chunk=recache_last_chunk,
+            )
 
     def reset(self) -> None:
         self._clear_pipeline(finalize_pending=False)

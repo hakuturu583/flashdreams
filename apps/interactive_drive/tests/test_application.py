@@ -842,7 +842,9 @@ def test_world_model_replace_prompt_commits_pending_chunk_under_old_prompt(
             ("finalize", autoregressive_index, cache)
         )
         or {},
-        replace_text=lambda cache, text: calls.append(("replace_text", cache, text)),
+        replace_text=lambda cache, text, **kwargs: calls.append(
+            ("replace_text", cache, text, kwargs)
+        ),
     )
     backend = object.__new__(WorldModelRenderBackend)
     backend._pipeline = pipeline
@@ -856,11 +858,16 @@ def test_world_model_replace_prompt_commits_pending_chunk_under_old_prompt(
 
     backend._cache = "cache"
     backend._pending_finalization_index = 3
-    backend.replace_prompt("red light ahead")
+    backend.replace_prompt("red light ahead", guidance_scale=3.0, guidance_chunks=4)
 
     assert calls == [
         ("finalize", 3, "cache"),
-        ("replace_text", "cache", [["red light ahead"]]),
+        (
+            "replace_text",
+            "cache",
+            [["red light ahead"]],
+            {"guidance_scale": 3.0, "guidance_chunks": 4, "recache_last_chunk": False},
+        ),
     ]
     assert backend._pending_finalization_index is None
     assert backend._scene.prompt == "red light ahead"
