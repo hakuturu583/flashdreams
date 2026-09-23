@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -821,3 +822,45 @@ def test_interactive_drive_discovers_scenes_and_weather_variants(
     assert app._config is not None
     assert app._config.app.scene_path == base
     assert app._config.app.variant == "rain"
+
+
+@pytest.mark.ci_cpu
+def test_world_model_replace_prompt_commits_pending_chunk_under_old_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+
+    @dataclass(frozen=True)
+    class _Scene:
+        prompt: str
+        scene_path: Path = Path("scene.usdz")
+
+    calls: list[tuple[Any, ...]] = []
+    pipeline = SimpleNamespace(
+        device=torch.device("cpu"),
+        finalize=lambda autoregressive_index, cache: calls.append(
+            ("finalize", autoregressive_index, cache)
+        )
+        or {},
+        replace_text=lambda cache, text: calls.append(("replace_text", cache, text)),
+    )
+    backend = object.__new__(WorldModelRenderBackend)
+    backend._pipeline = pipeline
+    backend._scene = _Scene(prompt="old")
+    backend._cache = None
+    backend._pending_finalization_index = None
+
+    # Before the first chunk only the starting prompt changes.
+    backend.replace_prompt("before start")
+    assert calls == [] and backend._scene.prompt == "before start"
+
+    backend._cache = "cache"
+    backend._pending_finalization_index = 3
+    backend.replace_prompt("red light ahead")
+
+    assert calls == [
+        ("finalize", 3, "cache"),
+        ("replace_text", "cache", [["red light ahead"]]),
+    ]
+    assert backend._pending_finalization_index is None
+    assert backend._scene.prompt == "red light ahead"

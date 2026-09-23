@@ -7,6 +7,7 @@ import hashlib
 import time
 from collections import deque
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -276,6 +277,33 @@ class WorldModelRenderBackend(RenderBackend):
                 merge_ready_time=merge_end,
             ),
         )
+
+    def replace_prompt(self, prompt: str) -> None:
+        """Condition the rest of the rollout on ``prompt``.
+
+        Before the first chunk this only changes the prompt the rollout will
+        start with. Mid-rollout the chunk still awaiting finalization is
+        committed under the old prompt first, then the pipeline swaps its text
+        conditioning (``replace_text``: the visual history stays, the next
+        chunk is generated under the new prompt). The scene keeps the prompt,
+        so a restarted rollout begins with it too.
+
+        Raises:
+            NotImplementedError: The pipeline cannot replace a live prompt.
+        """
+        if self._scene is not None:
+            self._scene = replace(self._scene, prompt=prompt)
+        _log_prompt_handoff("replace_prompt", self._require_scene())
+        if self._cache is None:
+            return
+        replace_text = getattr(self._pipeline, "replace_text", None)
+        if not callable(replace_text):
+            raise NotImplementedError(
+                f"{type(self._pipeline).__name__} cannot replace a live prompt"
+            )
+        self._finalize_pending()
+        with torch.cuda.device(self._pipeline.device):
+            replace_text(self._cache, [[prompt]])
 
     def reset(self) -> None:
         self._clear_pipeline(finalize_pending=False)
