@@ -485,6 +485,25 @@ class _CosmosNetworkShapeOps(torch.nn.Module):
             block_cache.cross_attn = self._make_cross_attn_cache(block_idx, context)
         return cache
 
+    @torch.no_grad()
+    def replace_text_embeddings(
+        self,
+        cache: CosmosDiTNetworkCache,
+        text_embeddings: Tensor,
+    ) -> None:
+        """Replace every block's cached cross-attention text K/V in place, as
+        ``CosmosDiTNetwork.replace_text_embeddings`` does, from the kept
+        projection weights (the PyTorch network may be released by now).
+
+        The addresses stay: the native runtime and its captured CUDA graph
+        hold them. Quantized copies derived from them are refreshed by
+        ``OptimizedDiTExecutor.refresh_cross_attention_caches``.
+        """
+        context = self._project_crossattn_context(text_embeddings)
+        for block_idx, block_cache in enumerate(cache.block_caches):
+            fresh = self._make_cross_attn_cache(block_idx, context)
+            block_cache.cross_attn.overwrite_kv_(fresh._k, fresh._v)
+
     def _weight(self, key: str, *, like: Tensor) -> Tensor:
         try:
             weight = self._cross_cache_weights[key]
@@ -1036,6 +1055,59 @@ class OptimizedDiTExecutor:
         self._optimized_scheduler_timestep_keys.clear()
         if self._optimized_call is not None:
             self._optimized_call.reset()
+
+    @torch.no_grad()
+    def refresh_cross_attention_caches(self, cache: CosmosTransformerCache) -> None:
+        """Re-derive the quantized cross-attention K/V the FP8 runtime keeps
+        after the cache's BF16 cross-attention K/V were overwritten in place
+        (``CosmosTransformer.replace_text_embeddings``).
+
+        ``_ensure_fp8_runtime`` quantizes them once per rollout; without this
+        the native forward would keep attending to the old prompt. The BF16
+        runtime reads the BF16 tensors themselves and needs nothing. Every
+        destination is written in place, since the captured graph holds its
+        address.
+        """
+        runtime = self._fp8_runtime
+        if not runtime:
+            return
+        blocks = cache.network_cache.block_caches
+        k_cross = [block.cross_attn._k for block in blocks]
+        v_cross = [block.cross_attn._v for block in blocks]
+
+        def as_fp8_bytes(t: Tensor) -> Tensor:
+            return t.to(torch.float8_e4m3fn).view(torch.uint8)
+
+        def as_fp8_bhmd_bytes(t: Tensor) -> Tensor:
+            return (
+                t.to(torch.float8_e4m3fn)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(torch.uint8)
+            )
+
+        for key, source, convert in (
+            ("k_cross_fp8_caches", k_cross, as_fp8_bytes),
+            ("v_cross_fp8_caches", v_cross, as_fp8_bytes),
+            ("k_cross_fp8_bhmd_caches", k_cross, as_fp8_bhmd_bytes),
+            ("v_cross_fp8_bhmd_caches", v_cross, as_fp8_bhmd_bytes),
+        ):
+            destinations = runtime.get(key)
+            if not destinations:
+                continue
+            for dst, src in zip(destinations, source, strict=True):
+                dst.copy_(convert(src))
+        sage3_keys = (
+            "k_cross_sage3_fp4_caches",
+            "v_cross_sage3_fp4_caches",
+            "k_cross_sage3_sf_caches",
+            "v_cross_sage3_sf_caches",
+        )
+        if runtime.get(sage3_keys[0]):
+            for block_idx, (k, v) in enumerate(zip(k_cross, v_cross, strict=True)):
+                fresh = self._native_extension.sage3_quantize_cross_kv_bf16(k, v)
+                for key, tensor in zip(sage3_keys, fresh, strict=True):
+                    runtime[key][block_idx].copy_(tensor)
 
     def _capture_network_cache_templates(self, cache: CosmosTransformerCache) -> None:
         templates = [_clone_network_cache(cache.network_cache)]

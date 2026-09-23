@@ -20,7 +20,7 @@ import shutil
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -1226,3 +1226,174 @@ def test_cuda_native_extension_builds(tmp_path: Path) -> None:
     assert plan["used_bytes"] == 64
     assert plan["remaining_bytes"] == 64
     assert plan["total_bytes"] == 128
+
+
+def _cross_weights(block_count: int, inner: int, context_dim: int, head_dim: int):
+    generator = torch.Generator().manual_seed(0)
+    weights: dict[str, torch.Tensor] = {}
+    for block_idx in range(block_count):
+        prefix = f"blocks.{block_idx}.cross_attn."
+        weights[prefix + "k_proj.weight"] = torch.randn(
+            inner, context_dim, generator=generator
+        )
+        weights[prefix + "v_proj.weight"] = torch.randn(
+            inner, context_dim, generator=generator
+        )
+        weights[prefix + "k_norm.weight"] = torch.rand(head_dim, generator=generator)
+    return weights
+
+
+@pytest.mark.ci_cpu
+def test_optimized_dit_shape_ops_replaces_text_kv_in_place() -> None:
+    optimized_dit = native.load_python_module("optimized_dit")
+    heads, head_dim, context_dim, tokens = 2, 8, 12, 5
+    shape_ops = optimized_dit._CosmosNetworkShapeOps(
+        SimpleNamespace(
+            patch_temporal=1,
+            patch_spatial=2,
+            num_heads=heads,
+            use_crossattn_projection=False,
+        ),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        cross_cache_weights=_cross_weights(2, heads * head_dim, context_dim, head_dim),
+    )
+    old_text = torch.randn(1, 1, tokens, context_dim)
+    new_text = torch.randn(1, 1, tokens, context_dim)
+    cache = SimpleNamespace(
+        block_caches=[
+            SimpleNamespace(cross_attn=shape_ops._make_cross_attn_cache(i, old_text))
+            for i in range(2)
+        ]
+    )
+    addresses = [
+        (block.cross_attn._k.data_ptr(), block.cross_attn._v.data_ptr())
+        for block in cache.block_caches
+    ]
+
+    shape_ops.replace_text_embeddings(cache, new_text)
+
+    for block_idx, block in enumerate(cache.block_caches):
+        expected = shape_ops._make_cross_attn_cache(block_idx, new_text)
+        assert (block.cross_attn._k.data_ptr(), block.cross_attn._v.data_ptr()) == (
+            addresses[block_idx]
+        )
+        torch.testing.assert_close(block.cross_attn._k, expected._k)
+        torch.testing.assert_close(block.cross_attn._v, expected._v)
+
+
+@pytest.mark.ci_cpu
+def test_optimized_dit_refreshes_fp8_cross_kv_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    optimized_dit = native.load_python_module("optimized_dit")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch.float8_e4m3fn is required for fp8 runtime setup")
+    monkeypatch.setattr(
+        optimized_dit,
+        "_make_cosmos_streaming_workspace",
+        lambda **_: {"workspace": torch.empty(1, dtype=torch.uint8)},
+    )
+    monkeypatch.setattr(
+        optimized_dit.OptimizedDiTExecutor,
+        "_sage3_status",
+        lambda self, device=None: (False, "not built"),
+    )
+    monkeypatch.setattr(
+        optimized_dit.OptimizedDiTExecutor,
+        "_sparge_status",
+        lambda self, device=None: (False, "not built"),
+    )
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            network=SimpleNamespace(
+                num_blocks=2,
+                num_heads=16,
+                model_channels=2048,
+                adaln_lora_dim=256,
+                timestep_scale=0.001,
+            ),
+            num_views=1,
+            use_cuda_graph=False,
+            cuda_graph_warmup_iters=0,
+        ),
+        network=SimpleNamespace(),
+    )
+    extension = SimpleNamespace(
+        optimized_dit_forward=lambda *args, **kwargs: None,
+        optimized_dit_supports_block_mod_cache=lambda: True,
+        optimized_dit_supports_hdmap_cache=lambda: True,
+    )
+    executor = optimized_dit.OptimizedDiTExecutor(
+        transformer, extension, dit_backend="fp8_kvcache_cudnn"
+    )
+    monkeypatch.setattr(executor, "_release_network_after_fp8_snapshot", lambda: None)
+    k_cross = [torch.randn((1, 4, 16, 128)).to(torch.bfloat16) for _ in range(2)]
+    v_cross = [torch.randn((1, 4, 16, 128)).to(torch.bfloat16) for _ in range(2)]
+    self_kv = torch.zeros((1, 4, 16, 128), dtype=torch.bfloat16)
+    runtime = executor._ensure_fp8_runtime(
+        k_cross=k_cross,
+        v_cross=v_cross,
+        k_self=[self_kv, self_kv],
+        v_self=[self_kv, self_kv],
+        tokens=4,
+        cache=SimpleNamespace(),
+    )
+    quantized = runtime["k_cross_fp8_caches"] + runtime["v_cross_fp8_caches"]
+    addresses = [t.data_ptr() for t in quantized]
+
+    # A prompt swap overwrites the BF16 cross K/V in place ...
+    for t in k_cross + v_cross:
+        t.copy_(torch.randn(t.shape).to(torch.bfloat16))
+    cache = SimpleNamespace(
+        network_cache=SimpleNamespace(
+            block_caches=[
+                SimpleNamespace(cross_attn=SimpleNamespace(_k=k, _v=v))
+                for k, v in zip(k_cross, v_cross, strict=True)
+            ]
+        )
+    )
+    executor.refresh_cross_attention_caches(cache)
+
+    # ... and the runtime's FP8 copies follow, at the same addresses.
+    assert [t.data_ptr() for t in quantized] == addresses
+    for dst, src in zip(quantized, k_cross + v_cross, strict=True):
+        assert torch.equal(dst, src.to(torch.float8_e4m3fn).view(torch.uint8))
+
+
+@pytest.mark.ci_cpu
+def test_cosmos_transformer_replaces_text_under_native_executor() -> None:
+    from omnidreams.impl.transformer import CosmosTransformer
+
+    calls: list[str] = []
+    cache = SimpleNamespace(network_cache="net-cache", text_edit_guidance="stale")
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(dtype=torch.float32),
+        device=torch.device("cpu"),
+        cp_groups=SimpleNamespace(V_group=None),
+        network=SimpleNamespace(
+            replace_text_embeddings=lambda net_cache, text: calls.append(
+                f"network:{net_cache}:{tuple(text.shape)}"
+            )
+        ),
+        _optimized_dit_executor=SimpleNamespace(
+            refresh_cross_attention_caches=lambda c: calls.append("refresh")
+        ),
+        _text_edit_lora=None,
+    )
+    text = torch.zeros(1, 1, 3, 4)
+
+    CosmosTransformer.replace_text_embeddings(
+        cast(Any, transformer), cast(Any, cache), text
+    )
+
+    assert calls == ["network:net-cache:(1, 1, 3, 4)", "refresh"]
+    assert cache.text_edit_guidance is None
+    with pytest.raises(NotImplementedError, match="guidance"):
+        CosmosTransformer.replace_text_embeddings(
+            cast(Any, transformer),
+            cast(Any, cache),
+            text,
+            guidance_scale=2.0,
+            guidance_chunks=1,
+        )

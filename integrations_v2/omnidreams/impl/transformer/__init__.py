@@ -718,10 +718,6 @@ class CosmosTransformer(Transformer[CosmosTransformerCache]):
             guidance_scale: New-minus-old edit strength.
             guidance_chunks: Number of upcoming chunks to guide.
         """
-        if self._optimized_dit_executor is not None:
-            raise NotImplementedError(
-                "Text replacement is not available with native DiT acceleration"
-            )
         cfg = self.config
         text_embeddings = text_embeddings.to(device=self.device, dtype=cfg.dtype)
         if self.cp_groups.V_group is not None:
@@ -729,6 +725,21 @@ class CosmosTransformer(Transformer[CosmosTransformerCache]):
                 text_embeddings, seq_dim=1, cp_group=self.cp_groups.V_group
             )
         use_guidance = guidance_scale != 1.0 and guidance_chunks > 0
+        if self._optimized_dit_executor is not None:
+            # Native DiT: a plain swap. The executor's shape ops rebuild the
+            # cross-attention K/V into the live buffers and the executor
+            # re-quantizes its copies. Guided edits read the old K/V (or the
+            # text-edit LoRA) through the PyTorch forward, which the native
+            # executor bypasses.
+            if use_guidance:
+                raise NotImplementedError(
+                    "Text-edit guidance is not available with native DiT "
+                    "acceleration; replace without guidance (guidance_scale=1.0)"
+                )
+            self.network.replace_text_embeddings(cache.network_cache, text_embeddings)
+            cache.text_edit_guidance = None
+            self._optimized_dit_executor.refresh_cross_attention_caches(cache)
+            return
         if use_guidance and cache.network_cache_uncond is not None:
             raise ValueError(
                 "Text-edit guidance cannot be combined with negative-prompt CFG"
